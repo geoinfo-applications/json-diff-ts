@@ -12,6 +12,8 @@ interface IChange {
   type: Operation;
   key: string;
   embeddedKey?: string | FunctionKey;
+  /** When true, embeddedKey is a dot-separated nested path (e.g. "a.b" → @.a.b). */
+  embeddedKeyIsPath?: boolean;
   value?: any;
   oldValue?: any;
   changes?: IChange[];
@@ -152,13 +154,14 @@ const revertChangeset = (obj: any, changeset: Changeset) => {
 const atomizeChangeset = (
   obj: Changeset | IChange,
   path = '$',
-  embeddedKey?: string | FunctionKey
+  embeddedKey?: string | FunctionKey,
+  embeddedKeyIsPath?: boolean
 ): IAtomicChange[] => {
   if (Array.isArray(obj)) {
-    return handleArray(obj, path, embeddedKey);
+    return handleArray(obj, path, embeddedKey, embeddedKeyIsPath);
   } else if (obj.changes || embeddedKey) {
     if (embeddedKey) {
-      const [updatedPath, atomicChange] = handleEmbeddedKey(embeddedKey, obj, path);
+      const [updatedPath, atomicChange] = handleEmbeddedKey(embeddedKey, obj, path, embeddedKeyIsPath);
       path = updatedPath;
       if (atomicChange) {
         return atomicChange;
@@ -166,37 +169,26 @@ const atomizeChangeset = (
     } else {
       path = append(path, obj.key);
     }
-    return atomizeChangeset(obj.changes || obj, path, obj.embeddedKey);
+    return atomizeChangeset(obj.changes || obj, path, obj.embeddedKey, obj.embeddedKeyIsPath);
   } else {
     const valueType = getTypeOfObj(obj.value);
-    // Special case for tests that expect specific path formats
-    // This is to maintain backward compatibility with existing tests
     let finalPath = path;
     if (!finalPath.endsWith(`[${obj.key}]`)) {
-      // For object values, still append the key to the path (fix for issue #184)
-      // But for tests that expect the old behavior, check if we're in a test environment
-      const isTestEnv = typeof process !== 'undefined' && process.env.NODE_ENV === 'test';
-      const isSpecialTestCase = isTestEnv && 
-        (path === '$[a.b]' || path === '$.a' || 
-         path.includes('items') || path.includes('$.a[?(@[c.d]'));
-      
-      if (!isSpecialTestCase || valueType === 'Object') {
-        // Avoid duplicate filter values at the end of the JSONPath
-        let endsWithFilterValue = false;
-        const filterEndIdx = path.lastIndexOf(')]');
-        if (filterEndIdx !== -1) {
-          const filterStartIdx = path.lastIndexOf('==', filterEndIdx);
-          if (filterStartIdx !== -1) {
-            const filterValue = path
-              .slice(filterStartIdx + 2, filterEndIdx)
-              // Remove single quotes at the start or end of the filter value
-              .replaceAll(/(^'|'$)/g, '');
-            endsWithFilterValue = filterValue === String(obj.key);
-          }
+      // Avoid duplicate filter values at the end of the JSONPath
+      let endsWithFilterValue = false;
+      const filterEndIdx = path.lastIndexOf(')]');
+      if (filterEndIdx !== -1) {
+        const filterStartIdx = path.lastIndexOf('==', filterEndIdx);
+        if (filterStartIdx !== -1) {
+          const filterValue = path
+            .slice(filterStartIdx + 2, filterEndIdx)
+            // Remove single quotes at the start or end of the filter value
+            .replaceAll(/(^'|'$)/g, '');
+          endsWithFilterValue = filterValue === String(obj.key);
         }
-        if (!endsWithFilterValue) {
-          finalPath = append(path, obj.key);
-        }
+      }
+      if (!endsWithFilterValue) {
+        finalPath = append(path, obj.key);
       }
     }
     
@@ -211,7 +203,7 @@ const atomizeChangeset = (
 };
 
 // Function to handle embeddedKey logic and update the path
-function handleEmbeddedKey(embeddedKey: string | FunctionKey, obj: IChange, path: string): [string, IAtomicChange[]?] {
+function handleEmbeddedKey(embeddedKey: string | FunctionKey, obj: IChange, path: string, isPath?: boolean): [string, IAtomicChange[]?] {
   if (embeddedKey === '$index') {
     path = `${path}[${obj.key}]`;
     return [path];
@@ -229,13 +221,13 @@ function handleEmbeddedKey(embeddedKey: string | FunctionKey, obj: IChange, path
       ]
     ];
   } else {
-    path = filterExpression(path, embeddedKey, obj.key);
+    path = filterExpression(path, embeddedKey as string, obj.key, isPath);
     return [path];
   }
 }
 
-const handleArray = (obj: Changeset | IChange[], path: string, embeddedKey?: string | FunctionKey): IAtomicChange[] => {
-  return obj.reduce((memo, change) => [...memo, ...atomizeChangeset(change, path, embeddedKey)], [] as IAtomicChange[]);
+const handleArray = (obj: Changeset | IChange[], path: string, embeddedKey?: string | FunctionKey, embeddedKeyIsPath?: boolean): IAtomicChange[] => {
+  return obj.reduce((memo, change) => [...memo, ...atomizeChangeset(change, path, embeddedKey, embeddedKeyIsPath)], [] as IAtomicChange[]);
 };
 
 /**
@@ -273,26 +265,32 @@ const unatomizeChangeset = (changes: IAtomicChange | IAtomicChange[]) => {
     } else {
       for (let i = 1; i < segments.length; i++) {
         const segment = segments[i];
-        // Matches JSONPath segments: "items[?(@.id=='123')]", "items[?(@.id==123)]", "items[2]", "items[?(@='123')]"
-        const result = /^([^[\]]+)\[\?\(@\.?([^=]*)=+'([^']+)'\)\]$|^(.+)\[(\d+)\]$/.exec(segment);
+        // Matches JSONPath filter segments and array index segments.
+        // Supports doubled-quote escaping in bracket keys and filter values (e.g. O''Brien).
+        const result = /^([^[\]]+)\[\?\(@(?:\.?([^=[]*)|(?:\['([^']*(?:''[^']*)*)'\]))=+'([^']*(?:''[^']*)*)'\)\]$|^(.+)\[(\d+)\]$/.exec(segment);
         // array
         if (result) {
           let key: string;
           let embeddedKey: string;
           let arrKey: string | number;
+          let isPath: boolean | undefined;
           if (result[1]) {
             key = result[1];
-            embeddedKey = result[2] || '$value';
-            arrKey = result[3];
+            // Unescape doubled quotes in bracket keys and filter values
+            embeddedKey = (result[3]?.replace(/''/g, "'") || result[2] || '$value');
+            // Dot-notation key (result[2]) with dots = nested path
+            isPath = (!result[3] && !!result[2] && result[2].includes('.') && NESTED_PATH_RE.test(result[2])) ? true : undefined;
+            arrKey = result[4]?.replace(/''/g, "'");
           } else {
-            key = result[4];
+            key = result[5];
             embeddedKey = '$index';
-            arrKey = Number(result[5]);
+            arrKey = Number(result[6]);
           }
           // leaf
           if (i === segments.length - 1) {
             ptr.key = key!;
             ptr.embeddedKey = embeddedKey!;
+            if (isPath) ptr.embeddedKeyIsPath = true;
             ptr.type = Operation.UPDATE;
             ptr.changes = [
               {
@@ -306,6 +304,7 @@ const unatomizeChangeset = (changes: IAtomicChange | IAtomicChange[]) => {
             // object
             ptr.key = key;
             ptr.embeddedKey = embeddedKey;
+            if (isPath) ptr.embeddedKeyIsPath = true;
             ptr.type = Operation.UPDATE;
             const newPtr = {} as IChange;
             ptr.changes = [
@@ -583,12 +582,21 @@ const compareArray = (oldObj: any, newObj: any, path: any, keyPath: any, options
   const indexedOldObj = convertArrayToObj(oldObj, uniqKey);
   const indexedNewObj = convertArrayToObj(newObj, uniqKey);
   const diffs = compareObject(indexedOldObj, indexedNewObj, path, keyPath, true, options);
+  const isFunctionKey = typeof uniqKey === 'function' && uniqKey.length === 2;
   if (diffs.length) {
+    const resolvedKey = isFunctionKey ? uniqKey(newObj[0] ?? oldObj[0], true) : uniqKey;
+    // Nested path when resolvedKey contains '.' and matches NESTED_PATH_RE.
+    // Function keys qualify directly; string keys qualify only if the sample
+    // element does not expose resolvedKey as a literal property.
+    const sampleEl = newObj[0] ?? oldObj[0];
+    const isNestedPath = typeof resolvedKey === 'string' && resolvedKey.includes('.') && NESTED_PATH_RE.test(resolvedKey)
+      && (isFunctionKey || !(sampleEl != null && typeof sampleEl === 'object' && resolvedKey in sampleEl));
     return [
       {
         type: Operation.UPDATE,
         key: getKey(path),
-        embeddedKey: typeof uniqKey === 'function' && uniqKey.length === 2 ? uniqKey(newObj[0], true) : uniqKey,
+        embeddedKey: resolvedKey,
+        ...(isNestedPath ? { embeddedKeyIsPath: true } : {}),
         changes: diffs
       }
     ];
@@ -633,8 +641,12 @@ const convertArrayToObj = (arr: any[], uniqKey: any) => {
       obj[i] = value;
     }
   } else {
-    // Convert string keys to functions for compatibility with es-toolkit keyBy
-    const keyFunction = typeof uniqKey === 'string' ? (item: any) => item[uniqKey] : uniqKey;
+    const maybeNestedPath = typeof uniqKey === 'string' && uniqKey.includes('.') && NESTED_PATH_RE.test(uniqKey);
+    const keyFunction = typeof uniqKey === 'string'
+      ? (maybeNestedPath
+          ? (item: any) => (item != null && typeof item === 'object' && uniqKey in item) ? item[uniqKey] : resolveProperty(item, uniqKey, true)
+          : (item: any) => item[uniqKey])
+      : uniqKey;
     obj = keyBy(arr, keyFunction);
   }
   return obj;
@@ -653,13 +665,13 @@ const comparePrimitives = (oldObj: any, newObj: any, path: any) => {
   return changes;
 };
 
-const removeKey = (obj: any, key: any, embeddedKey: any) => {
+const removeKey = (obj: any, key: any, embeddedKey: any, isPath?: boolean) => {
   if (Array.isArray(obj)) {
     if (embeddedKey === '$index') {
       obj.splice(Number(key), 1);
       return;
     }
-    const index = indexOfItemInArray(obj, embeddedKey, key);
+    const index = indexOfItemInArray(obj, embeddedKey, key, isPath);
     if (index === -1) {
       // tslint:disable-next-line:no-console
       console.warn(`Element with the key '${embeddedKey}' and value '${key}' could not be found in the array!`);
@@ -672,13 +684,22 @@ const removeKey = (obj: any, key: any, embeddedKey: any) => {
   }
 };
 
-const indexOfItemInArray = (arr: any[], key: any, value: any) => {
+/** Resolve a property on an object. When isPath is true, traverses nested dot-separated segments. */
+const resolveProperty = (obj: any, key: any, isPath?: boolean): any => {
+  if (obj == null) return undefined;
+  if (typeof key !== 'string' || !isPath || !key.includes('.')) return obj[key];
+  return key.split('.').reduce((cur, seg) => cur?.[seg], obj);
+};
+
+const indexOfItemInArray = (arr: any[], key: any, value: any, isPath?: boolean) => {
   if (key === '$value') {
     return arr.indexOf(value);
   }
   for (let i = 0; i < arr.length; i++) {
     const item = arr[i];
-    if (item && item[key] ? item[key].toString() === value.toString() : undefined) {
+    if (item == null) continue;
+    const resolved = resolveProperty(item, key, isPath);
+    if (resolved !== undefined && String(resolved) === String(value)) {
       return i;
     }
   }
@@ -698,7 +719,7 @@ const addKeyValue = (obj: any, key: any, value: any, embeddedKey?: any) => {
   }
 };
 
-const applyLeafChange = (obj: any, change: any, embeddedKey: any) => {
+const applyLeafChange = (obj: any, change: any, embeddedKey: any, isPath?: boolean) => {
   const { type, key, value } = change;
   switch (type) {
     case Operation.ADD:
@@ -706,7 +727,7 @@ const applyLeafChange = (obj: any, change: any, embeddedKey: any) => {
     case Operation.UPDATE:
       return modifyKeyValue(obj, key, value);
     case Operation.REMOVE:
-      return removeKey(obj, key, embeddedKey);
+      return removeKey(obj, key, embeddedKey, isPath);
   }
 };
 
@@ -740,7 +761,7 @@ const applyArrayChange = (arr: any[], change: any) => {
       (subchange.value === null && subchange.type === Operation.ADD) ||
       (subchange.value === undefined && subchange.type === Operation.ADD)
     ) {
-      applyLeafChange(arr, subchange, change.embeddedKey);
+      applyLeafChange(arr, subchange, change.embeddedKey, change.embeddedKeyIsPath);
     } else {
       let element;
       if (change.embeddedKey === '$index') {
@@ -751,7 +772,10 @@ const applyArrayChange = (arr: any[], change: any) => {
           element = arr[index];
         }
       } else {
-        element = arr.find((el) => el[change.embeddedKey]?.toString() === subchange.key.toString());
+        element = arr.find((el) => {
+          const resolved = resolveProperty(el, change.embeddedKey, change.embeddedKeyIsPath);
+          return resolved !== undefined && String(resolved) === String(subchange.key);
+        });
       }
       if (element) {
         applyChangeset(element, subchange.changes);
@@ -769,7 +793,7 @@ const applyBranchChange = (obj: any, change: any) => {
   }
 };
 
-const revertLeafChange = (obj: any, change: any, embeddedKey = '$index') => {
+const revertLeafChange = (obj: any, change: any, embeddedKey = '$index', isPath?: boolean) => {
   const { type, key, value, oldValue } = change;
   
   // Special handling for $root key
@@ -806,7 +830,7 @@ const revertLeafChange = (obj: any, change: any, embeddedKey = '$index') => {
   // Regular property handling
   switch (type) {
     case Operation.ADD:
-      return removeKey(obj, key, embeddedKey);
+      return removeKey(obj, key, embeddedKey, isPath);
     case Operation.UPDATE:
       return modifyKeyValue(obj, key, oldValue);
     case Operation.REMOVE:
@@ -827,7 +851,7 @@ const revertLeafChange = (obj: any, change: any, embeddedKey = '$index') => {
 const revertArrayChange = (arr: any[], change: any) => {
   for (const subchange of change.changes) {
     if (subchange.value != null || subchange.type === Operation.REMOVE) {
-      revertLeafChange(arr, subchange, change.embeddedKey);
+      revertLeafChange(arr, subchange, change.embeddedKey, change.embeddedKeyIsPath);
     } else {
       let element;
       if (change.embeddedKey === '$index') {
@@ -838,7 +862,10 @@ const revertArrayChange = (arr: any[], change: any) => {
           element = arr[index];
         }
       } else {
-        element = arr.find((el) => el[change.embeddedKey]?.toString() === subchange.key.toString());
+        element = arr.find((el) => {
+          const resolved = resolveProperty(el, change.embeddedKey, change.embeddedKeyIsPath);
+          return resolved !== undefined && String(resolved) === String(subchange.key);
+        });
       }
       if (element) {
         revertChangeset(element, subchange.changes);
@@ -861,12 +888,22 @@ function append(basePath: string, nextSegment: string): string {
   return nextSegment.includes('.') ? `${basePath}[${nextSegment}]` : `${basePath}.${nextSegment}`;
 }
 
-/** returns a JSON Path filter expression; e.g., `$.pet[(?name='spot')]` */
-function filterExpression(basePath: string, filterKey: string | FunctionKey, filterValue: string | number) {
-  const value = typeof filterValue === 'number' ? filterValue : `'${filterValue}'`;
-  return typeof filterKey === 'string' && filterKey.includes('.')
-    ? `${basePath}[?(@[${filterKey}]==${value})]`
-    : `${basePath}[?(@.${filterKey}==${value})]`;
+const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const NESTED_PATH_RE = /^[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*$/;
+
+/** returns a JSON Path filter expression; e.g., `$.pet[?(@.name=='spot')]` */
+function filterExpression(basePath: string, filterKey: string, filterValue: string, isPath?: boolean) {
+  const escapedValue = `'${filterValue.replace(/'/g, "''")}'`;
+  let memberAccess: string;
+  if (isPath && NESTED_PATH_RE.test(filterKey)) {
+    // Nested path: use dot notation for each segment (e.g. @.a.b)
+    memberAccess = '.' + filterKey;
+  } else if (IDENT_RE.test(filterKey)) {
+    memberAccess = `.${filterKey}`;
+  } else {
+    memberAccess = `['${filterKey.replace(/'/g, "''")}']`;
+  }
+  return `${basePath}[?(@${memberAccess}==${escapedValue})]`;
 }
 
 export {
