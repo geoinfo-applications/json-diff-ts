@@ -32,7 +32,7 @@ interface Options {
   arrayIdentityKeys?: EmbeddedObjKeysType | EmbeddedObjKeysMapType;
   /** @deprecated Use `arrayIdentityKeys` instead. */
   embeddedObjKeys?: EmbeddedObjKeysType | EmbeddedObjKeysMapType;
-  keysToSkip?: readonly string[];
+  keysToSkip?: readonly (string | RegExp)[];
   treatTypeChangeAsReplace?: boolean;
 }
 
@@ -372,9 +372,13 @@ const getKey = (path: string) => {
 const compare = (oldObj: any, newObj: any, path: any, keyPath: any, options: Options) => {
   let changes: any[] = [];
 
-  // Check if the current path should be skipped 
+  // Check if the current path should be skipped
   const currentPath = keyPath.join('.');
-  if (options.keysToSkip?.some(skipPath => {
+  if (options.keysToSkip?.some(skipSpec => {
+    if (skipSpec instanceof RegExp) {
+      return skipSpec.test(currentPath);
+    }
+    const skipPath = skipSpec;
     // Exact match
     if (currentPath === skipPath) {
       return true;
@@ -505,6 +509,11 @@ const compare = (oldObj: any, newObj: any, path: any, keyPath: any, options: Opt
   return changes;
 };
 
+const isPathSkipped = (currentPath: string, skipSpec: string | RegExp): boolean =>
+  skipSpec instanceof RegExp
+    ? skipSpec.test(currentPath)
+    : currentPath === skipSpec || currentPath.startsWith(skipSpec + '.');
+
 const compareObject = (oldObj: any, newObj: any, path: any, keyPath: any, skipPath = false, options: Options = {}) => {
   let k;
   let newKeyPath;
@@ -536,7 +545,7 @@ const compareObject = (oldObj: any, newObj: any, path: any, keyPath: any, skipPa
     newKeyPath = skipPath ? keyPath : keyPath.concat([k]);
     // Check if the path should be skipped
     const currentPath = newKeyPath.join('.');
-    if (options.keysToSkip?.some(skipPath => currentPath === skipPath || currentPath.startsWith(skipPath + '.'))) {
+    if (options.keysToSkip?.some(skipSpec => isPathSkipped(currentPath, skipSpec))) {
       continue; // Skip adding this key
     }
     changes.push({
@@ -552,7 +561,7 @@ const compareObject = (oldObj: any, newObj: any, path: any, keyPath: any, skipPa
     newKeyPath = skipPath ? keyPath : keyPath.concat([k]);
     // Check if the path should be skipped
     const currentPath = newKeyPath.join('.');
-    if (options.keysToSkip?.some(skipPath => currentPath === skipPath || currentPath.startsWith(skipPath + '.'))) {
+    if (options.keysToSkip?.some(skipSpec => isPathSkipped(currentPath, skipSpec))) {
       continue; // Skip removing this key
     }
     changes.push({
